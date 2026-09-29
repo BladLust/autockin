@@ -2,6 +2,10 @@ name: autockin
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
   schedule:
     - cron: '42 9 * * *'
       timezone: 'Asia/Shanghai'
@@ -13,6 +17,7 @@ jobs:
   checkin:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    environment: checkin
 
     steps:
       - name: Checkout
