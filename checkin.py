@@ -9,35 +9,41 @@ STATUS_URL = f"{BASE_URL}/api/user/status"
 
 TIMEOUT = 15
 
-# Exact User-Agent from the captured Safari request.
+# Default to the macOS Safari profile supplied by upstream.
+# Override USER_AGENT with the value from the browser that supplied COOKIES.
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/605.1.15 (KHTML, like Gecko) "
     "Version/27.0 Safari/605.1.15"
 )
 
-# Exact headers captured from Safari's check-in POST.
-CHECKIN_HEADERS = {
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Encoding": "gzip, deflate, br, zstd",
-    "Accept-Language": "zh-CN,zh-Hans;q=0.9",
-    "Cache-Control": "no-cache",
-    "Content-Type": "application/json;charset=utf-8",
-    "Origin": BASE_URL,
-    "Pragma": "no-cache",
-    "Priority": "u=3, i",
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "same-origin",
-    "User-Agent": USER_AGENT,
-}
 
-# Exact headers captured from Safari's status GET.
-STATUS_HEADERS = {
-    key: value for key, value in CHECKIN_HEADERS.items() if key not in {"Content-Type", "Origin"}
-}
+def build_headers():
+    user_agent = os.environ.get("USER_AGENT", "").strip() or USER_AGENT
+    language = os.environ.get("ACCEPT_LANGUAGE", "").strip() or "zh-CN,zh-Hans;q=0.9"
+    for name, value in (("USER_AGENT", user_agent), ("ACCEPT_LANGUAGE", language)):
+        if "\r" in value or "\n" in value:
+            raise ValueError(f"{name} must be a single-line header value")
 
-# Match the browser's 24-byte JSON payload.
+    # Safari does not send Chromium's sec-ch-ua client hints. Only advertise
+    # compression formats that this requests installation can actually decode.
+    common = {
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Encoding": requests.utils.default_headers()["Accept-Encoding"],
+        "Accept-Language": language,
+        "Referer": f"{BASE_URL}/console/checkin",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        "User-Agent": user_agent,
+    }
+    return (
+        {**common, "Content-Type": "application/json;charset=utf-8", "Origin": BASE_URL},
+        common.copy(),
+    )
+
+
+# Keep the compact JSON body used by the browser; requests computes its length.
 CHECKIN_BODY = b'{"token":"glados.cloud"}'
 
 SUCCESS_MESSAGES = (
@@ -53,9 +59,13 @@ def request_json(session, method, url, headers, **kwargs):
         url,
         headers=headers,
         timeout=TIMEOUT,
+        allow_redirects=False,
         **kwargs,
     )
 
+    # A login redirect must not forward a manually supplied Cookie header.
+    if 300 <= response.status_code < 400:
+        raise RuntimeError("Unexpected redirect; check the endpoint and account cookie")
     response.raise_for_status()
 
     try:
@@ -70,12 +80,13 @@ def request_json(session, method, url, headers, **kwargs):
 
 
 def checkin(session, cookie):
+    checkin_headers, _ = build_headers()
     result = request_json(
         session,
         "POST",
         CHECKIN_URL,
         headers={
-            **CHECKIN_HEADERS,
+            **checkin_headers,
             "Cookie": cookie,
         },
         data=CHECKIN_BODY,
@@ -91,12 +102,13 @@ def checkin(session, cookie):
 
 
 def get_status(session, cookie):
+    _, status_headers = build_headers()
     result = request_json(
         session,
         "GET",
         STATUS_URL,
         headers={
-            **STATUS_HEADERS,
+            **status_headers,
             "Cookie": cookie,
         },
     )
