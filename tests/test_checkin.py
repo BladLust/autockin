@@ -68,6 +68,48 @@ class CheckinTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'invalid JSON'):
             checkin.request_json(session, 'GET', checkin.STATUS_URL, {})
 
+    @patch('checkin.time.sleep')
+    def test_read_timeout_then_success(self, sleep):
+        session = Mock()
+        response = Mock(status_code=200)
+        response.json.return_value = {'message': 'checkin repeats!'}
+        session.request.side_effect = [requests.ReadTimeout(), response]
+        self.assertEqual(checkin.checkin(session, 'secret'), 'checkin repeats!')
+        self.assertEqual(session.request.call_count, 2)
+        sleep.assert_called_once_with(2)
+
+    @patch('checkin.time.sleep')
+    def test_timeout_exhaustion_is_bounded_and_private(self, sleep):
+        session = Mock()
+        session.request.side_effect = requests.ReadTimeout('secret cookie')
+        with self.assertRaisesRegex(RuntimeError, 'POST .*3 attempt') as error:
+            checkin.checkin(session, 'secret cookie')
+        self.assertNotIn('secret cookie', str(error.exception))
+        self.assertEqual(session.request.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+    @patch('checkin.time.sleep')
+    def test_transient_status_retries_but_auth_failure_does_not(self, sleep):
+        session = Mock()
+        unavailable = Mock(status_code=503)
+        denied = Mock(status_code=401)
+        denied.raise_for_status.side_effect = requests.HTTPError('401')
+        session.request.side_effect = [unavailable, denied]
+        with self.assertRaises(requests.HTTPError):
+            checkin.get_status(session, 'secret')
+        self.assertEqual(session.request.call_count, 2)
+        unavailable.close.assert_called_once()
+        sleep.assert_called_once_with(2)
+
+    @patch('checkin.time.sleep')
+    def test_arbitrary_post_not_retried(self, sleep):
+        session = Mock()
+        session.request.side_effect = requests.ReadTimeout()
+        with self.assertRaises(RuntimeError):
+            checkin.request_json(session, 'POST', checkin.BASE_URL, {})
+        self.assertEqual(session.request.call_count, 1)
+        sleep.assert_not_called()
+
     @patch.dict(os.environ, {'COOKIES': 'first&&second'}, clear=True)
     @patch('checkin.run_account', side_effect=[RuntimeError('failed'), None])
     def test_account_failure_does_not_skip_next_account(self, run):

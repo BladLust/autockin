@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 
 import requests
 
@@ -7,7 +8,9 @@ BASE_URL = "https://glados.cloud"
 CHECKIN_URL = f"{BASE_URL}/api/user/checkin"
 STATUS_URL = f"{BASE_URL}/api/user/status"
 
-TIMEOUT = 15
+TIMEOUT = (10, 45)  # Separate connection and response-read limits.
+MAX_ATTEMPTS = 3
+TRANSIENT_STATUSES = {502, 503, 504}
 
 # Default to the macOS Safari profile supplied by upstream.
 # Override USER_AGENT with the value from the browser that supplied COOKIES.
@@ -53,15 +56,34 @@ SUCCESS_MESSAGES = (
 )
 
 
-def request_json(session, method, url, headers, **kwargs):
-    response = session.request(
-        method,
-        url,
-        headers=headers,
-        timeout=TIMEOUT,
-        allow_redirects=False,
-        **kwargs,
-    )
+def request_json(session, method, url, headers, *, retry_safe=False, **kwargs):
+    attempts = MAX_ATTEMPTS if retry_safe else 1
+    label = f"{method} {url}"
+    for attempt in range(1, attempts + 1):
+        try:
+            response = session.request(
+                method, url, headers=headers, timeout=TIMEOUT,
+                allow_redirects=False, **kwargs,
+            )
+        except requests.exceptions.SSLError:
+            raise RuntimeError(f"{label}: TLS verification failed") from None
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            reason = type(exc).__name__
+            if attempt == attempts:
+                raise RuntimeError(
+                    f"{label}: {reason} after {attempt} attempt(s); "
+                    "no confirmed result (the server may have processed the request)"
+                ) from None
+        else:
+            if response.status_code not in TRANSIENT_STATUSES:
+                break
+            reason = f"HTTP {response.status_code}"
+            response.close()
+            if attempt == attempts:
+                raise RuntimeError(f"{label}: {reason} after {attempt} attempt(s)")
+        delay = 2 ** attempt
+        print(f"{label}: {reason}; retry {attempt + 1}/{attempts} in {delay}s", flush=True)
+        time.sleep(delay)
 
     # A login redirect must not forward a manually supplied Cookie header.
     if 300 <= response.status_code < 400:
@@ -90,6 +112,8 @@ def checkin(session, cookie):
             "Cookie": cookie,
         },
         data=CHECKIN_BODY,
+        # This daily endpoint explicitly accepts repeat check-ins.
+        retry_safe=True,
     )
 
     message = result.get("message", "")
@@ -107,6 +131,7 @@ def get_status(session, cookie):
         session,
         "GET",
         STATUS_URL,
+        retry_safe=True,
         headers={
             **status_headers,
             "Cookie": cookie,
@@ -139,6 +164,7 @@ def run_account(cookie, index):
         session.headers.clear()
 
         message = checkin(session, cookie)
+        print(f"Account {index}: check-in confirmed: {message}", flush=True)
         remaining_days = get_status(session, cookie)
 
     # Avoid exposing email addresses or cookies in Actions logs.
